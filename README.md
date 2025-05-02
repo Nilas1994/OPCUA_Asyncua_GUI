@@ -3,3 +3,6 @@ Asyncua based GUI Client - Work in Progress --Not Fully Functional yet
 
 
 Lots of issues still to be resolved feel free to post solution or improvements
+
+
+fully based on https://github.com/FreeOpcUa/opcua-asyncio

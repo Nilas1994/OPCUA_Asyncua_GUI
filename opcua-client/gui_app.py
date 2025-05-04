@@ -4,6 +4,7 @@ import time
 import asyncio
 from typing import Dict, Any, Optional, List, Tuple, Union, Set
 from datetime import datetime
+import json
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout, 
@@ -19,6 +20,7 @@ from config_manager import Config, SecurityPolicy
 from client_core import OpcUaClient
 from utils import get_logger, ConnectionStatus, get_config_dir, get_certificates_dir, get_output_dir
 from node_manager import NodeManager, NodeType
+from json_output_manager import JsonOutputManager
 
 logger = get_logger("gui_app")
 
@@ -137,8 +139,19 @@ class OpcUaClientApplication(QMainWindow):
         """Initialize the application"""
         super().__init__()
         
+        # Ensure output directory exists
+        os.makedirs(get_output_dir(), exist_ok=True)
+        
         # Load configuration
         self.config = Config.load()
+        
+        # Ensure config has json_output_dir set
+        if not self.config.json_output_dir:
+            self.config.json_output_dir = get_output_dir()
+            self.config.save()
+        
+        # Ensure JSON output directory exists
+        os.makedirs(self.config.json_output_dir, exist_ok=True)
         
         # Initialize client
         self.client = OpcUaClient(self.config)
@@ -160,7 +173,7 @@ class OpcUaClientApplication(QMainWindow):
         self.connection_check_timer.timeout.connect(self.check_connection_status)
         self.connection_check_timer.start(5000)  # Check every 5 seconds
         
-        # Auto-connect if configured
+        # Auto-connect if configure
         if self.config.auto_connect:
             # Add small delay to ensure worker thread is running
             QTimer.singleShot(500, self.connect_to_server)
@@ -179,8 +192,8 @@ class OpcUaClientApplication(QMainWindow):
         self.client.node_unsubscribed.connect(self.on_node_unsubscribed)
         self.client.subscription_data_changed.connect(self.on_subscription_data_changed)
         
-        # XML
-        self.client.xml_updated.connect(self.on_xml_updated)
+        # JSON
+        self.client.json_updated.connect(self.on_json_updated)
         
         # Reconnection
         self.client.reconnection_status.connect(self.on_reconnection_status)
@@ -197,6 +210,153 @@ class OpcUaClientApplication(QMainWindow):
         
         # Register write callback
         self.node_manager.register_write_callback(self.write_node_value)
+        
+        # Add file watcher notification handling
+        self.client.json_output_manager.file_watcher.file_changed.connect(
+            self.on_custom_file_changed
+        )
+
+        # Monitor JSON output manager signals
+        if hasattr(self.client, 'json_output_manager'):
+            self.client.json_output_manager.write_requested.connect(self.on_write_requested)
+            self.client.json_output_manager.write_completed.connect(self.on_write_completed)
+            
+            # Update monitoring status
+            QTimer.singleShot(1000, self.update_monitor_status)
+
+
+    
+    def on_custom_file_changed(self, filepath: str):
+        """Handle custom file change with improved logging"""
+        # Refresh custom nodes list to show changes
+        self.refresh_custom_nodes()
+        
+        # Update monitoring status
+        self.last_change_label.setText(os.path.basename(filepath))
+        
+        # Log the change
+        self.log_json_operation(f"File changed: {os.path.basename(filepath)}")
+        
+        # Update active writes count
+        if hasattr(self.client, 'json_output_manager'):
+            active_count = len(self.client.json_output_manager.active_write_requests)
+            self.active_writes_label.setText(str(active_count))
+
+    def on_write_requested(self, node_id: str, value: Any):
+        """Handle write request signal"""
+        self.last_write_label.setText(f"{node_id}: {value}")
+        self.log_json_operation(f"Write requested: {node_id} = {value}")
+        
+        # Update active writes count
+        if hasattr(self.client, 'json_output_manager'):
+            active_count = len(self.client.json_output_manager.active_write_requests)
+            self.active_writes_label.setText(str(active_count))
+
+    def on_write_completed(self, node_id: str, success: bool):
+        """Handle write completion signal"""
+        status = "Success" if success else "Failed"
+        self.log_json_operation(f"Write completed: {node_id} - {status}")
+        
+        # Update active writes count
+        if hasattr(self.client, 'json_output_manager'):
+            active_count = len(self.client.json_output_manager.active_write_requests)
+            self.active_writes_label.setText(str(active_count))
+
+    def update_monitor_status(self):
+        """Update file monitoring status"""
+        if hasattr(self.client, 'json_output_manager') and hasattr(self.client.json_output_manager, 'file_watcher'):
+            watcher = self.client.json_output_manager.file_watcher
+            if watcher and watcher.watcher:
+                files_count = len(watcher.watcher.files())
+                dirs_count = len(watcher.watcher.directories())
+                self.monitor_status_label.setText(f"Monitoring {files_count} files, {dirs_count} directories")
+            else:
+                self.monitor_status_label.setText("File watcher not initialized")
+        else:
+            self.monitor_status_label.setText("JSON output manager not available")
+        
+        # Schedule next update
+        QTimer.singleShot(5000, self.update_monitor_status)
+
+    def create_test_file(self):
+        """Create a test file in the custom nodes directory"""
+        try:
+            custom_dir = os.path.join(self.config.json_output_dir, "registered_nodes", "custom")
+            test_node_id = f"ns=2;s=TestNode{int(time.time())}"
+            
+            test_data = {
+                "node_id": test_node_id,
+                "display_name": "Test Node",
+                "node_type": "Custom",
+                "data_type": "Boolean",
+                "value": True,
+                "toggle_interval": 1.0,
+                "writeable": True,
+                "timestamp": datetime.now().isoformat(),
+                "structure": {
+                    "parent_path": "Test/Path",
+                    "node_class": "Variable",
+                    "display_name": "Test Node"
+                },
+                "metadata": {
+                    "last_updated": datetime.now().isoformat(),
+                    "registration_active": True,
+                    "write_requested": False
+                }
+            }
+            
+            # Create filename
+            safe_name = test_node_id.replace('=', '_').replace(';', '_').replace('/', '_').replace('\\', '_')
+            filename = f"{safe_name}.json"
+            filepath = os.path.join(custom_dir, filename)
+            
+            # Save file
+            with open(filepath, 'w') as f:
+                json.dump(test_data, f, indent=2)
+            
+            self.log_json_operation(f"Created test file: {filename}")
+            QMessageBox.information(self, "Test File Created", f"Created test file: {filename}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error creating test file: {str(e)}")
+
+    def test_request_write(self):
+        """Test write request for a selected node"""
+        selected_items = self.custom_nodes_list.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "Please select a custom node first")
+            return
+        
+        item = selected_items[0]
+        filepath = item.data(0, Qt.UserRole)
+        
+        try:
+            # Load current file
+            with open(filepath, 'r') as f:
+                node_data = json.load(f)
+            
+            # Toggle the boolean value for testing
+            current_value = node_data.get("value", False)
+            new_value = not current_value if isinstance(current_value, bool) else True
+            node_data["value"] = new_value
+            
+            # Set write_requested flag
+            if "metadata" not in node_data:
+                node_data["metadata"] = {}
+            
+            node_data["metadata"]["write_requested"] = True
+            node_data["metadata"]["write_request_time"] = datetime.now().isoformat()
+            
+            # Save file to trigger file watcher
+            with open(filepath, 'w') as f:
+                json.dump(node_data, f, indent=2)
+            
+            self.log_json_operation(f"Test write request triggered for {os.path.basename(filepath)}")
+            QMessageBox.information(self, "Test Write", f"Write request triggered for value: {new_value}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error triggering test write: {str(e)}")
+
     
     def init_ui(self):
         """Initialize the user interface"""
@@ -218,7 +378,7 @@ class OpcUaClientApplication(QMainWindow):
         self.init_browser_tab()
         self.init_subscriptions_tab()
         self.init_registered_nodes_tab()
-        self.init_output_tab()
+        self.init_output_tab()  # Updated to handle JSON output
         self.init_log_tab()
         
         # Status bar
@@ -374,19 +534,19 @@ class OpcUaClientApplication(QMainWindow):
         reconnect_group.setLayout(reconnect_layout)
         advanced_layout.addWidget(reconnect_group)
         
-        # Output group
+        # Output group (in Advanced Settings tab)
         output_group = QGroupBox("Output")
         output_layout = QFormLayout()
         
-        # XML output path
-        self.xml_path_input = QLineEdit()
-        self.xml_path_input.setReadOnly(True)
-        xml_browse_btn = QPushButton("Browse...")
-        xml_browse_btn.clicked.connect(self.browse_xml_output)
-        xml_layout = QHBoxLayout()
-        xml_layout.addWidget(self.xml_path_input)
-        xml_layout.addWidget(xml_browse_btn)
-        output_layout.addRow("XML Output Path:", xml_layout)
+        # JSON output directory
+        self.json_path_input = QLineEdit()
+        self.json_path_input.setReadOnly(True)
+        json_browse_btn = QPushButton("Browse...")
+        json_browse_btn.clicked.connect(self.browse_json_output_dir)
+        json_layout = QHBoxLayout()
+        json_layout.addWidget(self.json_path_input)
+        json_layout.addWidget(json_browse_btn)
+        output_layout.addRow("JSON Output Directory:", json_layout)
         
         output_group.setLayout(output_layout)
         advanced_layout.addWidget(output_group)
@@ -711,28 +871,300 @@ class OpcUaClientApplication(QMainWindow):
         self.tab_widget.addTab(registered_tab, "Registered Nodes")
     
     def init_output_tab(self):
-        """Initialize the output tab"""
+        """Initialize the output tab for JSON files"""
         output_tab = QWidget()
         output_layout = QVBoxLayout(output_tab)
         
-        # XML preview
-        self.xml_preview = QTextEdit()
-        self.xml_preview.setReadOnly(True)
-        output_layout.addWidget(self.xml_preview)
+        # Custom nodes section
+        custom_group = QGroupBox("Custom Nodes")
+        custom_layout = QVBoxLayout()
         
-        # Output buttons
-        output_buttons_layout = QHBoxLayout()
+        # File browser for custom nodes
+        file_browser_layout = QHBoxLayout()
+        self.custom_nodes_list = QTreeWidget()
+        self.custom_nodes_list.setHeaderLabels(["Node Name", "File", "Last Modified"])
+        self.custom_nodes_list.itemClicked.connect(self.on_custom_node_selected)
+        file_browser_layout.addWidget(self.custom_nodes_list)
         
-        self.refresh_xml_btn = QPushButton("Refresh XML")
-        self.refresh_xml_btn.clicked.connect(self.refresh_xml)
+        # Node content viewer
+        content_layout = QVBoxLayout()
+        content_layout.addWidget(QLabel("Node JSON Content:"))
+        self.custom_node_content = QTextEdit()
+        self.custom_node_content.setFixedHeight(200)
+        content_layout.addWidget(self.custom_node_content)
+        file_browser_layout.addLayout(content_layout)
         
-        output_buttons_layout.addWidget(self.refresh_xml_btn)
-        output_buttons_layout.addStretch(1)
+        custom_layout.addLayout(file_browser_layout)
         
-        output_layout.addLayout(output_buttons_layout)
+        # Custom node controls
+        controls_layout = QHBoxLayout()
+        
+        self.refresh_custom_btn = QPushButton("Refresh Custom Nodes")
+        self.refresh_custom_btn.clicked.connect(self.refresh_custom_nodes)
+        
+        self.save_custom_btn = QPushButton("Save Changes")
+        self.save_custom_btn.clicked.connect(self.save_custom_node)
+        self.save_custom_btn.setEnabled(False)
+        
+        # Remove this button since we don't need manual write requests anymore
+        # self.write_custom_btn = QPushButton("Request Write")
+        # self.write_custom_btn.clicked.connect(self.request_custom_write)
+        # self.write_custom_btn.setEnabled(False)
+        # Add manual write request button
+        self.request_write_btn = QPushButton("Request Write")
+        self.request_write_btn.clicked.connect(self.request_write_for_selected)
+        self.request_write_btn.setEnabled(False)
+
+        controls_layout.addWidget(self.refresh_custom_btn)
+        controls_layout.addWidget(self.save_custom_btn)
+        controls_layout.addWidget(self.request_write_btn)
+        controls_layout.addStretch(1)
+        
+        custom_layout.addLayout(controls_layout)
+        custom_group.setLayout(custom_layout)
+        output_layout.addWidget(custom_group)
+        
+        # JSON output locations info
+        info_group = QGroupBox("JSON Output Information")
+        info_layout = QFormLayout()
+        
+        # Base output directory
+        info_layout.addRow("Output Directory:", QLabel(self.config.json_output_dir))
+        
+        # Subscription directory
+        subscriptions_path = os.path.join(self.config.json_output_dir, "subscriptions")
+        info_layout.addRow("Subscriptions:", QLabel(subscriptions_path))
+        
+        # Registered nodes directory
+        registered_path = os.path.join(self.config.json_output_dir, "registered_nodes")
+        info_layout.addRow("Registered Nodes:", QLabel(registered_path))
+        
+        # Custom nodes directory
+        custom_path = os.path.join(self.config.json_output_dir, "registered_nodes", "custom")
+        info_layout.addRow("Custom Nodes:", QLabel(custom_path))
+        
+        info_group.setLayout(info_layout)
+        output_layout.addWidget(info_group)
+        
+        # Log section
+        log_group = QGroupBox("JSON Operations Log")
+        log_layout = QVBoxLayout()
+        
+        self.json_log = QTextEdit()
+        self.json_log.setReadOnly(True)
+        self.json_log.setFixedHeight(150)
+        log_layout.addWidget(self.json_log)
+        
+        log_group.setLayout(log_layout)
+        output_layout.addWidget(log_group)
         
         # Add output tab to main tab widget
         self.tab_widget.addTab(output_tab, "Output")
+
+        # Add to init_output_tab() method in gui_app.py:
+
+        # Add monitoring status group
+        monitor_group = QGroupBox("File Monitoring Status")
+        monitor_layout = QFormLayout()
+
+        # File monitor status
+        self.monitor_status_label = QLabel("Not monitoring")
+        monitor_layout.addRow("Monitor Status:", self.monitor_status_label)
+
+        # Last file change
+        self.last_change_label = QLabel("None")
+        monitor_layout.addRow("Last File Change:", self.last_change_label)
+
+        # Last write request
+        self.last_write_label = QLabel("None")
+        monitor_layout.addRow("Last Write Request:", self.last_write_label)
+
+        # Active write requests
+        self.active_writes_label = QLabel("0")
+        monitor_layout.addRow("Active Writes:", self.active_writes_label)
+
+        # Test buttons
+        test_layout = QHBoxLayout()
+
+        self.test_create_file_btn = QPushButton("Create Test File")
+        self.test_create_file_btn.clicked.connect(self.create_test_file)
+
+        self.test_request_write_btn = QPushButton("Request Test Write")
+        self.test_request_write_btn.clicked.connect(self.test_request_write)
+
+        test_layout.addWidget(self.test_create_file_btn)
+        test_layout.addWidget(self.test_request_write_btn)
+
+        monitor_layout.addRow("Test Actions:", test_layout)
+        monitor_group.setLayout(monitor_layout)
+        output_layout.addWidget(monitor_group)
+
+    def refresh_custom_nodes(self):
+        """Refresh the list of custom nodes"""
+        self.custom_nodes_list.clear()
+        
+        custom_dir = os.path.join(self.config.json_output_dir, "registered_nodes", "custom")
+        
+        if os.path.exists(custom_dir):
+            for filename in os.listdir(custom_dir):
+                if filename.endswith('.json'):
+                    filepath = os.path.join(custom_dir, filename)
+                    try:
+                        with open(filepath, 'r') as f:
+                            node_data = json.load(f)
+                        
+                        item = QTreeWidgetItem(self.custom_nodes_list)
+                        item.setText(0, node_data.get("display_name", "Unknown"))
+                        item.setText(1, filename)
+                        
+                        # Get modification time
+                        mod_time = os.path.getmtime(filepath)
+                        mod_datetime = datetime.fromtimestamp(mod_time)
+                        item.setText(2, mod_datetime.strftime("%Y-%m-%d %H:%M:%S"))
+                        
+                        # Store full path in item data
+                        item.setData(0, Qt.UserRole, filepath)
+                        
+                    except Exception as e:
+                        logger.error(f"Error reading custom node file {filename}: {str(e)}")
+
+    def save_custom_node(self):
+        """Save changes to custom node file"""
+        selected_items = self.custom_nodes_list.selectedItems()
+        if not selected_items:
+            return
+        
+        item = selected_items[0]
+        filepath = item.data(0, Qt.UserRole)
+        
+        try:
+            # Parse JSON from editor
+            content = self.custom_node_content.toPlainText()
+            node_data = json.loads(content)
+            
+            # Ensure metadata exists
+            if "metadata" not in node_data:
+                node_data["metadata"] = {}
+            
+            # Set write_requested flag
+            node_data["metadata"]["write_requested"] = True
+            node_data["metadata"]["write_request_time"] = datetime.now().isoformat()
+            node_data["metadata"]["last_updated"] = datetime.now().isoformat()
+            
+            # Save to file
+            with open(filepath, 'w') as f:
+                json.dump(node_data, f, indent=2)
+            
+            # Log success
+            self.log_json_operation(f"Saved changes to {os.path.basename(filepath)} with write request")
+            
+            QMessageBox.information(self, "Changes Saved", 
+                                "Changes saved with write request. The value will be written to OPC UA server.")
+            
+        except json.JSONDecodeError as e:
+            QMessageBox.critical(self, "JSON Error", f"Invalid JSON: {str(e)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error saving file: {str(e)}")
+    
+    def request_write_for_selected(self):
+        """Manually request write for selected custom node"""
+        selected_items = self.custom_nodes_list.selectedItems()
+        if not selected_items:
+            return
+        
+        item = selected_items[0]
+        filepath = item.data(0, Qt.UserRole)
+        
+        try:
+            # Load current file content
+            with open(filepath, 'r') as f:
+                node_data = json.load(f)
+            
+            # Ensure metadata exists
+            if "metadata" not in node_data:
+                node_data["metadata"] = {}
+            
+            # Set write_requested flag
+            node_data["metadata"]["write_requested"] = True
+            node_data["metadata"]["write_request_time"] = datetime.now().isoformat()
+            
+            # Save file with write request
+            with open(filepath, 'w') as f:
+                json.dump(node_data, f, indent=2)
+            
+            # Log operation
+            self.log_json_operation(f"Write requested for {os.path.basename(filepath)}")
+            
+            QMessageBox.information(self, "Write Requested", 
+                                "Write request submitted. The value will be written to OPC UA server.")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error requesting write: {str(e)}")
+
+    def log_json_operation(self, message: str):
+        """Log JSON operation to log window"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = f"[{timestamp}] {message}"
+        self.json_log.append(log_message)
+        
+        # Auto-scroll to bottom
+        scrollbar = self.json_log.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def on_custom_node_selected(self, item, column):
+        """Handle custom node selection"""
+        filepath = item.data(0, Qt.UserRole)
+        
+        try:
+            with open(filepath, 'r') as f:
+                content = f.read()
+            
+            # Pretty print JSON
+            node_data = json.loads(content)
+            pretty_json = json.dumps(node_data, indent=2)
+            
+            # Display content
+            self.custom_node_content.setPlainText(pretty_json)
+            
+            # Enable buttons
+            self.save_custom_btn.setEnabled(True)
+            self.request_write_btn.setEnabled(True)
+            
+        except Exception as e:
+            self.custom_node_content.setPlainText(f"Error loading file: {str(e)}")
+            self.save_custom_btn.setEnabled(False)
+            self.request_write_btn.setEnabled(False)
+
+    def browse_json_output_dir(self):
+        """Browse for JSON output directory"""
+        dir_path = QFileDialog.getExistingDirectory(
+            self, "Select JSON Output Directory", self.config.json_output_dir
+        )
+        
+        if dir_path:
+            self.json_path_input.setText(dir_path)
+            # Update config immediately
+            self.config.json_output_dir = dir_path
+            os.makedirs(dir_path, exist_ok=True)
+            
+            # Ensure the new directory structure exists
+            os.makedirs(os.path.join(dir_path, "subscriptions"), exist_ok=True)
+            os.makedirs(os.path.join(dir_path, "registered_nodes"), exist_ok=True)
+            os.makedirs(os.path.join(dir_path, "registered_nodes", "custom"), exist_ok=True)
+            
+            self.config.save()
+            
+            # Update client's JSON output manager
+            if hasattr(self.client, 'json_output_manager'):
+                # Reinitialize with new directory
+                self.client.json_output_manager = JsonOutputManager(dir_path)
+                self.client.json_output_manager.json_updated.connect(self.client.on_json_updated)
+            
+            # Refresh custom nodes
+            self.refresh_custom_nodes()
+            
+            # Log the change
+            self.log_json_operation(f"Changed output directory to: {dir_path}")
     
     def init_log_tab(self):
         """Initialize the log tab"""
@@ -821,6 +1253,41 @@ class OpcUaClientApplication(QMainWindow):
         if hasattr(self.client, 'loop') and self.client.loop:
             asyncio.run_coroutine_threadsafe(self.client.disconnect(), self.client.loop)
     
+    def update_ui_from_config(self):
+        """Update UI elements from configuration"""
+        # Connection settings
+        self.endpoint_input.setText(self.config.endpoint)
+        self.username_input.setText(self.config.username)
+        self.auto_connect_cb.setChecked(self.config.auto_connect)
+        
+        # Security settings
+        index = self.security_policy_combo.findText(self.config.security_policy.value)
+        if index >= 0:
+            self.security_policy_combo.setCurrentIndex(index)
+        
+        self.cert_path_input.setText(self.config.certificate_path)
+        self.key_path_input.setText(self.config.private_key_path)
+        self.generate_cert_cb.setChecked(self.config.generate_certificates)
+        self.on_generate_cert_changed(self.generate_cert_cb.checkState())
+        
+        # Certificate info
+        self.common_name_input.setText(self.config.certificate_info.get("common_name", "OPC UA Client"))
+        self.organization_input.setText(self.config.certificate_info.get("organization", "Organization"))
+        self.org_unit_input.setText(self.config.certificate_info.get("organization_unit", "Department"))
+        self.locality_input.setText(self.config.certificate_info.get("locality", "City"))
+        self.state_input.setText(self.config.certificate_info.get("state", "State"))
+        self.country_input.setText(self.config.certificate_info.get("country", "US"))
+        self.validity_input.setText(str(self.config.certificate_info.get("days_valid", 365)))
+        
+        # Reconnection settings
+        self.auto_reconnect_cb.setChecked(self.config.auto_reconnect)
+        self.reconnect_delay_input.setText(str(self.config.reconnect_delay))
+        self.max_reconnect_delay_input.setText(str(self.config.max_reconnect_delay))
+        self.max_reconnect_attempts_input.setText(str(self.config.max_reconnect_attempts))
+        
+        # Output settings - Update to use json_output_dir
+        self.json_path_input.setText(self.config.json_output_dir)
+
     def update_config_from_ui(self):
         """Update configuration from UI values"""
         # Connection settings
@@ -863,49 +1330,118 @@ class OpcUaClientApplication(QMainWindow):
             self.config.max_reconnect_delay = 60
         
         try:
-            self.config.max_reconnect_attempts = int
             self.config.max_reconnect_attempts = int(self.max_reconnect_attempts_input.text())
         except (ValueError, TypeError):
             self.config.max_reconnect_attempts = 0
         
-        # Output settings
-        self.config.xml_output_path = self.xml_path_input.text()
+        # Output settings - FIX: Use json_output_dir and ensure it exists
+        output_dir = self.json_path_input.text()
+        if output_dir:
+            self.config.json_output_dir = output_dir
+            # Ensure directory exists
+            os.makedirs(output_dir, exist_ok=True)
+        
+        # Save config immediately
+        self.config.save()
+
+    def browse_json_output_dir(self):
+        """Browse for JSON output directory"""
+        dir_path = QFileDialog.getExistingDirectory(
+            self, "Select JSON Output Directory", self.config.json_output_dir
+        )
+        
+        if dir_path:
+            self.json_path_input.setText(dir_path)
+            # Update config immediately
+            self.config.json_output_dir = dir_path
+            os.makedirs(dir_path, exist_ok=True)
+            self.config.save()
+            
+            # Update client's JSON output manager
+            if hasattr(self.client, 'json_output_manager'):
+                # Reinitialize with new directory
+                self.client.json_output_manager = JsonOutputManager(dir_path)
+                self.client.json_output_manager.json_updated.connect(self.client.on_json_updated)
+            
+            # Refresh JSON view
+            self.refresh_json()
+
+    def refresh_json(self):
+        """Refresh JSON previews"""
+        # Subscriptions JSON
+        subscriptions_file = os.path.join(self.config.json_output_dir, "opcua_subscriptions.json")
+        if os.path.exists(subscriptions_file):
+            try:
+                with open(subscriptions_file, 'r') as f:
+                    json_content = f.read()
+                self.subscriptions_json_preview.setPlainText(json_content)
+            except Exception as e:
+                self.subscriptions_json_preview.setPlainText(f"Error loading JSON: {str(e)}")
+        else:
+            self.subscriptions_json_preview.setPlainText("No subscriptions JSON file available")
+        
+        # Registered nodes JSON
+        registered_file = os.path.join(self.config.json_output_dir, "opcua_registered_nodes.json")
+        if os.path.exists(registered_file):
+            try:
+                with open(registered_file, 'r') as f:
+                    json_content = f.read()
+                self.registered_json_preview.setPlainText(json_content)
+            except Exception as e:
+                self.registered_json_preview.setPlainText(f"Error loading JSON: {str(e)}")
+        else:
+            self.registered_json_preview.setPlainText("No registered nodes JSON file available")
     
-    def update_ui_from_config(self):
-        """Update UI elements from configuration"""
-        # Connection settings
-        self.endpoint_input.setText(self.config.endpoint)
-        self.username_input.setText(self.config.username)
-        self.auto_connect_cb.setChecked(self.config.auto_connect)
+    def on_json_updated(self, filename):
+        """Handle JSON file updates"""
+        # Log the update
+        self.log_json_operation(f"JSON file updated: {os.path.basename(filename)}")
         
-        # Security settings
-        index = self.security_policy_combo.findText(self.config.security_policy.value)
-        if index >= 0:
-            self.security_policy_combo.setCurrentIndex(index)
-        
-        self.cert_path_input.setText(self.config.certificate_path)
-        self.key_path_input.setText(self.config.private_key_path)
-        self.generate_cert_cb.setChecked(self.config.generate_certificates)
-        self.on_generate_cert_changed(self.generate_cert_cb.checkState())
-        
-        # Certificate info
-        self.common_name_input.setText(self.config.certificate_info.get("common_name", "OPC UA Client"))
-        self.organization_input.setText(self.config.certificate_info.get("organization", "Organization"))
-        self.org_unit_input.setText(self.config.certificate_info.get("organization_unit", "Department"))
-        self.locality_input.setText(self.config.certificate_info.get("locality", "City"))
-        self.state_input.setText(self.config.certificate_info.get("state", "State"))
-        self.country_input.setText(self.config.certificate_info.get("country", "US"))
-        self.validity_input.setText(str(self.config.certificate_info.get("days_valid", 365)))
-        
-        # Reconnection settings
-        self.auto_reconnect_cb.setChecked(self.config.auto_reconnect)
-        self.reconnect_delay_input.setText(str(self.config.reconnect_delay))
-        self.max_reconnect_delay_input.setText(str(self.config.max_reconnect_delay))
-        self.max_reconnect_attempts_input.setText(str(self.config.max_reconnect_attempts))
-        
-        # Output settings
-        self.xml_path_input.setText(self.config.xml_output_path)
-    
+        # Refresh custom nodes if it's a custom node file
+        if "custom" in filename:
+            self.refresh_custom_nodes()
+
+    def edit_custom_nodes(self):
+        """Open custom nodes for editing"""
+        # Get custom nodes from JSON output manager
+        if hasattr(self.client, 'json_output_manager'):
+            custom_nodes = self.client.json_output_manager.read_custom_nodes()
+            
+            # Create a dialog for editing
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Edit Custom Nodes")
+            dialog.setMinimumSize(600, 400)
+            
+            layout = QVBoxLayout(dialog)
+            
+            # JSON editor
+            json_editor = QTextEdit()
+            json_editor.setPlainText(json.dumps(custom_nodes, indent=2))
+            layout.addWidget(json_editor)
+            
+            # Buttons
+            button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            button_box.accepted.connect(dialog.accept)
+            button_box.rejected.connect(dialog.reject)
+            layout.addWidget(button_box)
+            
+            # Show dialog
+            if dialog.exec_() == QDialog.Accepted:
+                try:
+                    # Parse edited JSON
+                    edited_nodes = json.loads(json_editor.toPlainText())
+                    
+                    # Update custom nodes
+                    success = self.client.json_output_manager.update_custom_nodes(edited_nodes)
+                    
+                    if success:
+                        QMessageBox.information(self, "Success", "Custom nodes updated successfully")
+                        self.refresh_json()
+                    else:
+                        QMessageBox.warning(self, "Error", "Failed to update custom nodes")
+                except json.JSONDecodeError as e:
+                    QMessageBox.critical(self, "JSON Error", f"Invalid JSON: {str(e)}")
+
     def save_config(self):
         """Save configuration to file"""
         # Update config from UI
@@ -973,18 +1509,6 @@ class OpcUaClientApplication(QMainWindow):
         
         if file_path:
             self.key_path_input.setText(file_path)
-    
-    def browse_xml_output(self):
-        """Browse for XML output file"""
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Select XML Output", get_output_dir(), 
-            "XML Files (*.xml);;All Files (*)"
-        )
-        
-        if file_path:
-            if not file_path.endswith('.xml'):
-                file_path += '.xml'
-            self.xml_path_input.setText(file_path)
     
     def on_generate_cert_changed(self, state):
         """Handle certificate generation checkbox state change"""
@@ -1362,7 +1886,6 @@ class OpcUaClientApplication(QMainWindow):
                     # Format complex values
                     if isinstance(value, (list, dict)):
                         try:
-                            import json
                             item.setText(1, json.dumps(value, indent=2))
                         except:
                             item.setText(1, str(value))
@@ -1677,7 +2200,7 @@ class OpcUaClientApplication(QMainWindow):
         
         item = selected_items[0]
         node_id = item.text(1)
-        node_type = self.node_type_combo.currentText()
+        new_node_type = self.node_type_combo.currentText()
         
         try:
             toggle_interval = float(self.toggle_interval_input.text())
@@ -1686,36 +2209,54 @@ class OpcUaClientApplication(QMainWindow):
             self.toggle_interval_input.setText("1.0")
         
         # Update node type in tree
-        item.setText(4, node_type)
+        item.setText(4, new_node_type)
         item.setText(5, str(toggle_interval))
         
         # Update node manager
         for nt in NodeType:
-            if nt.value == node_type:
+            if nt.value == new_node_type:
                 self.node_manager.set_node_type(node_id, nt, toggle_interval)
                 break
         
         # Update config
         if node_id in self.config.registered_nodes:
+            old_type = self.config.registered_nodes[node_id].get("node_type", "Standard")
+            
             # Update node settings
-            self.config.registered_nodes[node_id]["node_type"] = node_type
+            self.config.registered_nodes[node_id]["node_type"] = new_node_type
             self.config.registered_nodes[node_id]["toggle_interval"] = toggle_interval
             
             # Save config immediately to ensure changes persist
             self.config.save()
-            logger.info(f"Saved configuration with node {node_id} set to type {node_type}")
+            logger.info(f"Saved configuration with node {node_id} set to type {new_node_type}")
+            
+            # Update JSON file location if type changed to/from Custom
+            if old_type != new_node_type:
+                if hasattr(self.client, 'json_output_manager'):
+                    # Re-register the node with new type to ensure it's moved to the right folder
+                    node_info = self.config.registered_nodes[node_id]
+                    node_info["node_type"] = new_node_type
+                    node_info["toggle_interval"] = toggle_interval
+                    
+                    if hasattr(self.client, 'loop') and self.client.loop:
+                        asyncio.run_coroutine_threadsafe(
+                            self._reregister_node(node_id),
+                            self.client.loop
+                        )
+                    
+                    self.log_json_operation(f"Moved node {node_id} from {old_type} to {new_node_type}")
         
         # Update client settings
         if hasattr(self.client, 'loop') and self.client.loop:
             # Update client's registered node settings
             async def update_node_settings():
                 if node_id in self.client.registered_nodes:
-                    self.client.registered_nodes[node_id]["node_type"] = node_type
+                    self.client.registered_nodes[node_id]["node_type"] = new_node_type
                     self.client.registered_nodes[node_id]["toggle_interval"] = toggle_interval
                     
                     # Set up or remove LiveBit functionality as needed
                     data_type = self.client.registered_nodes[node_id].get("data_type", "")
-                    if node_type == "LiveBit" and data_type == "Boolean":
+                    if new_node_type == "LiveBit" and data_type == "Boolean":
                         # Add to LiveBit nodes
                         self.client.livebit_nodes[node_id] = toggle_interval
                         self.client.last_toggle_time[node_id] = time.time()
@@ -1730,6 +2271,36 @@ class OpcUaClientApplication(QMainWindow):
             asyncio.run_coroutine_threadsafe(update_node_settings(), self.client.loop)
         
         self.status_message.setText(f"Applied configuration for {node_id}")
+    
+    async def _reregister_node(self, node_id: str):
+        """Unregister and re-register a node to update its file location"""
+        try:
+            # Remove old registration and file
+            self.client.json_output_manager.remove_registered_node(node_id)
+            
+            # Get node from client
+            node = self.client.client.get_node(node_id)
+            
+            # Read current value
+            value = await node.read_value()
+            
+            # Get node info from current registration
+            if node_id in self.client.registered_nodes:
+                node_info = self.client.registered_nodes[node_id].copy()
+                
+                # Get structure info
+                structure_info = self.client.get_node_structure_info(node_id)
+                
+                # Re-register with updated type
+                self.client.json_output_manager.add_registered_node(
+                    node_id,
+                    node_info,
+                    structure_info
+                )
+                
+                logger.info(f"Re-registered node {node_id} with type {node_info.get('node_type', 'Standard')}")
+        except Exception as e:
+            logger.error(f"Error re-registering node {node_id}: {str(e)}")
     
     def write_node_value(self, node_id, value, save_value=True):
         """Write value to node (callback for node manager)"""
@@ -1909,23 +2480,15 @@ class OpcUaClientApplication(QMainWindow):
         else:
             self.status_message.setText(f"Method call error: {result}")
     
-    def refresh_xml(self):
-        """Refresh XML preview"""
-        if not self.config.xml_output_path or not os.path.exists(self.config.xml_output_path):
-            self.xml_preview.setPlainText("No XML file available")
-            return
+    def on_json_updated(self, filename):
+        """Handle JSON file updates"""
+        # Log the update
+        basename = os.path.basename(filename)
+        self.log_json_operation(f"JSON file updated: {basename}")
         
-        try:
-            with open(self.config.xml_output_path, 'r') as f:
-                xml_content = f.read()
-            
-            self.xml_preview.setPlainText(xml_content)
-        except Exception as e:
-            self.xml_preview.setPlainText(f"Error loading XML: {str(e)}")
-    
-    def on_xml_updated(self):
-        """Handle XML update"""
-        self.refresh_xml()
+        # Refresh custom nodes list if it's a custom node file
+        if "custom" in filename and filename.endswith('.json'):
+            self.refresh_custom_nodes()
     
     def closeEvent(self, event):
         """Handle application close event"""

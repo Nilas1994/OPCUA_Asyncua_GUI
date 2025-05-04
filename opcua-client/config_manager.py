@@ -64,14 +64,10 @@ class Config:
             "application_uri": None
         }
         
-        # Output settings
-        self.xml_output_path = os.path.join(
-            os.path.expanduser("~"), 
-            ".opcua-client", 
-            "output", 
-            "opcua_data.xml"
-        )
-        
+        # Output settings - FIX: Direct default to output directory
+        from utils import get_output_dir
+        self.json_output_dir = get_output_dir()
+            
         # Node lists
         self.subscribed_nodes = {}  # Dict[node_id, display_name]
         self.registered_nodes = {}  # Dict[node_id, node_info]
@@ -83,7 +79,8 @@ class Config:
         """Ensure required directories exist"""
         config_dir = get_config_dir()
         cert_dir = get_certificates_dir()
-        os.makedirs(os.path.dirname(self.xml_output_path), exist_ok=True)
+        # Ensure JSON output directory exists
+        os.makedirs(self.json_output_dir, exist_ok=True)
     
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -105,7 +102,7 @@ class Config:
             "max_reconnect_attempts": self.max_reconnect_attempts,
             "generate_certificates": self.generate_certificates,
             "certificate_info": self.certificate_info,
-            "xml_output_path": self.xml_output_path,
+            "json_output_dir": self.json_output_dir, # FIX: Use JSON output directory
             "subscribed_nodes": self.subscribed_nodes,
             "registered_nodes": self.registered_nodes
         }
@@ -151,8 +148,9 @@ class Config:
         if "certificate_info" in data:
             config.certificate_info = data["certificate_info"]
         
-        # Output settings
-        config.xml_output_path = data.get("xml_output_path", config.xml_output_path)
+        # Output settings - handle new JSON config
+        if "json_output_dir" in data:
+            config.json_output_dir = data["json_output_dir"]
         
         # Node lists
         config.subscribed_nodes = data.get("subscribed_nodes", {})

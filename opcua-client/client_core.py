@@ -2,11 +2,10 @@ import os
 import asyncio
 import random
 import json
+from json_output_manager import JsonOutputManager
 from typing import Dict, Any, Optional, List, Tuple, Callable, Union, Set
 from datetime import datetime
 from enum import Enum
-import xml.etree.ElementTree as ET
-from xml.dom import minidom
 import time
 
 from asyncua import Client, Node, ua
@@ -46,20 +45,14 @@ class OpcUaClient(QObject):
     node_subscribed = pyqtSignal(str, str, object)  # node_id, display_name, initial_value
     node_unsubscribed = pyqtSignal(str)  # node_id
     subscription_data_changed = pyqtSignal(str, object, str)  # node_id, value, timestamp
-    xml_updated = pyqtSignal()
+    json_updated = pyqtSignal(str)  # filename
     reconnection_status = pyqtSignal(int, int, str)  # attempts, max_attempts, message
     method_called = pyqtSignal(str, bool, str)  # method_id, success, result
     node_registered = pyqtSignal(str, str, str, object)  # node_id, display_name, data_type, initial_value
     node_write_completed = pyqtSignal(str, bool, str)  # node_id, success, message
     
     def __init__(self, config: Config, parent=None):
-        """
-        Initialize OPC UA Client
-        
-        Args:
-            config: Client configuration
-            parent: Parent QObject
-        """
+        """Initialize OPC UA Client"""
         super().__init__(parent)
         self.config = config
         self.client = None
@@ -74,9 +67,14 @@ class OpcUaClient(QObject):
         self.connection_start_time = None
         self.connection_diagnostics = {}
         
-        # For XML output
-        self.xml_root = None
-        self.init_xml()
+        os.makedirs(self.config.json_output_dir, exist_ok=True)
+
+        # For JSON output with JSON
+        self.json_output_manager = JsonOutputManager(self.config.json_output_dir)
+        
+        self.json_output_manager.json_updated.connect(self.on_json_updated)
+        # Connect write requested signal
+        self.json_output_manager.write_requested.connect(self.on_write_requested)
         
         # Extension object manager
         self.extension_object_manager = ExtensionObjectManager()
@@ -88,80 +86,57 @@ class OpcUaClient(QObject):
         self.livebit_timer.timeout.connect(self.process_livebit_nodes)
         self.livebit_timer.start(100)  # Check every 100ms
         
+        # Remove the old custom node check timer - it's now handled by file watcher
+        # self.custom_node_check_timer = QTimer(self)
+        # self.custom_node_check_timer.timeout.connect(self.check_custom_node_writes)
+        # self.custom_node_check_timer.start(1000)  # Check every second
+        
         # Worker thread for async operations
         self.worker_thread = None
         self.loop = None
     
-    def init_xml(self):
-        """Initialize XML structure for data output"""
-        self.xml_root = ET.Element("OpcUaData")
-        self.xml_root.set("timestamp", datetime.now().isoformat())
-        self.xml_root.set("client", "OPC UA Client")
-        self.save_xml()
-    
-    def save_xml(self):
-        """Save XML data to file"""
-        if not self.config.xml_output_path:
+    def on_write_requested(self, node_id: str, value: Any):
+        """Handle write request from file watcher"""
+        if not self.connected or not self.client:
+            logger.warning(f"Cannot write to {node_id}: not connected")
+            self.json_output_manager.mark_write_completed(node_id, False)
             return
         
+        logger.info(f"Write requested for node {node_id} with value {value}")
+        
+        # Schedule the write operation
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(
+                self._handle_write_request(node_id, value),
+                self.loop
+            )
+
+    async def _handle_write_request(self, node_id: str, value: Any):
+        """Handle write request asynchronously"""
         try:
-            # Update timestamp
-            self.xml_root.set("timestamp", datetime.now().isoformat())
+            success, message = await self.write_value(node_id, value, False)
             
-            # Pretty print XML
-            xml_str = minidom.parseString(ET.tostring(self.xml_root)).toprettyxml(indent="  ")
+            if success:
+                logger.info(f"Successfully wrote value to node {node_id}: {value}")
+                
+                # Update the JSON file with the actual written value
+                # This ensures the file reflects the current OPC UA value
+                if node_id in self.registered_nodes:
+                    self.registered_nodes[node_id]["last_value"] = value
+                    
+                    # Update JSON output - this will update the file
+                    self.json_output_manager.update_registered_node_value(node_id, value)
+                
+            else:
+                logger.error(f"Failed to write value to node {node_id}: {message}")
             
-            # Remove empty lines
-            xml_str = '\n'.join([line for line in xml_str.split('\n') if line.strip()])
+            # Notify JSON output manager of completion
+            self.json_output_manager.mark_write_completed(node_id, success)
             
-            # Save to file
-            with open(self.config.xml_output_path, 'w') as f:
-                f.write(xml_str)
-            
-            # Emit signal
-            self.xml_updated.emit()
-        
         except Exception as e:
-            logger.error(f"Error saving XML: {str(e)}")
+            logger.error(f"Error in write request handler for node {node_id}: {str(e)}")
+            self.json_output_manager.mark_write_completed(node_id, False)
     
-    def add_node_to_xml(self, node_id: str, display_name: str, value: Any):
-        """
-        Add or update a node in the XML output
-        
-        Args:
-            node_id: Node ID
-            display_name: Display name
-            value: Current value
-        """
-        # Check if node exists
-        node_element = self.xml_root.find(f"./Node[@id='{node_id}']")
-        
-        if node_element is not None:
-            # Update existing node
-            node_element.set("timestamp", datetime.now().isoformat())
-            node_element.text = str(value)
-        else:
-            # Create new node element
-            node_element = ET.SubElement(self.xml_root, "Node")
-            node_element.set("id", node_id)
-            node_element.set("name", display_name)
-            node_element.set("timestamp", datetime.now().isoformat())
-            node_element.text = str(value)
-        
-        # Save XML
-        self.save_xml()
-    
-    def remove_node_from_xml(self, node_id: str):
-        """
-        Remove a node from the XML output
-        
-        Args:
-            node_id: Node ID to remove
-        """
-        node_element = self.xml_root.find(f"./Node[@id='{node_id}']")
-        if node_element is not None:
-            self.xml_root.remove(node_element)
-            self.save_xml()
     
     def start(self):
         """Start the client worker thread"""
@@ -1046,7 +1021,70 @@ class OpcUaClient(QObject):
                 error_msg
             )
     
-    
+    def get_node_structure_info(self, node_id: str) -> dict:
+        """
+        Get structure information for a node
+        
+        Args:
+            node_id: Node ID
+            
+        Returns:
+            Dictionary with structure information
+        """
+        structure_info = {
+            "parent_path": "",
+            "node_class": "Unknown",
+            "display_name": "Unknown"
+        }
+        
+        if not self.connected or not self.client:
+            return structure_info
+        
+        try:
+            node = self.client.get_node(node_id)
+            
+            # Get display name
+            display_name = node.read_display_name()
+            structure_info["display_name"] = display_name.Text
+            
+            # Get node class
+            node_class = node.read_node_class()
+            structure_info["node_class"] = node_class.name
+            
+            # Get parent path by traversing up the hierarchy
+            parent_path = []
+            current_node = node
+            
+            try:
+                while True:
+                    # Get parent references
+                    parent_refs = current_node.get_references(refs=ua.ObjectIds.HierarchicalReferences, direction=ua.BrowseDirection.Inverse)
+                    
+                    if not parent_refs:
+                        break
+                    
+                    # Get first parent (assuming single parent hierarchy)
+                    parent_node = self.client.get_node(parent_refs[0].NodeId)
+                    parent_name = parent_node.read_display_name().Text
+                    
+                    parent_path.append(parent_name)
+                    current_node = parent_node
+                    
+                    # Stop at root or after reasonable depth
+                    if parent_node.nodeid.to_string() == "i=84" or len(parent_path) > 10:
+                        break
+            except Exception:
+                pass
+            
+            # Reverse path for correct order
+            parent_path.reverse()
+            structure_info["parent_path"] = "/".join(parent_path)
+            
+        except Exception as e:
+            logger.error(f"Error getting structure info for node {node_id}: {str(e)}")
+        
+        return structure_info
+
     async def subscribe_to_node(self, node_id: str, display_name: str):
         """
         Subscribe to data changes for a node
@@ -1084,8 +1122,16 @@ class OpcUaClient(QObject):
             handle = await self.subscription.subscribe_data_change(node)
             self.subscription_handles[node_id] = (handle, display_name)
             
-            # Add to XML
-            self.add_node_to_xml(node_id, display_name, initial_value)
+            # Get structure info
+            structure_info = self.get_node_structure_info(node_id)
+            
+            # Add to JSON output
+            self.json_output_manager.add_subscription(
+                node_id, 
+                display_name, 
+                initial_value,
+                structure_info["parent_path"]
+            )
             
             # Add to config
             self.config.subscribed_nodes[node_id] = display_name
@@ -1100,38 +1146,6 @@ class OpcUaClient(QObject):
             logger.error(error_msg)
             self.connection_status_changed.emit(ConnectionStatus.ERROR, error_msg)
     
-    async def unsubscribe_from_node(self, node_id: str):
-        """
-        Unsubscribe from data changes for a node
-        
-        Args:
-            node_id: Node ID
-        """
-        if not self.connected or not self.client or not self.subscription:
-            return
-        
-        try:
-            logger.info(f"Unsubscribing from node: {node_id}")
-            
-            if node_id in self.subscription_handles:
-                handle, _ = self.subscription_handles[node_id]
-                await self.subscription.unsubscribe(handle)
-                del self.subscription_handles[node_id]
-                
-                # Remove from XML
-                self.remove_node_from_xml(node_id)
-                
-                # Remove from config
-                if node_id in self.config.subscribed_nodes:
-                    del self.config.subscribed_nodes[node_id]
-                
-                # Emit signal
-                self.node_unsubscribed.emit(node_id)
-                
-                logger.info(f"Unsubscribed from node: {node_id}")
-            
-        except Exception as e:
-            logger.warning(f"Error unsubscribing from node {node_id}: {str(e)}")
     
     async def unsubscribe_all(self):
         """Unsubscribe from all nodes"""
@@ -1158,6 +1172,40 @@ class OpcUaClient(QObject):
             
         except Exception as e:
             logger.error(f"Error unsubscribing from all nodes: {str(e)}")
+
+    async def unsubscribe_from_node(self, node_id: str):
+        """
+        Unsubscribe from data changes for a node
+        
+        Args:
+            node_id: Node ID
+        """
+        if not self.connected or not self.client or not self.subscription:
+            return
+        
+        try:
+            logger.info(f"Unsubscribing from node: {node_id}")
+            
+            if node_id in self.subscription_handles:
+                handle, _ = self.subscription_handles[node_id]
+                await self.subscription.unsubscribe(handle)
+                del self.subscription_handles[node_id]
+                
+                # Remove from JSON output
+                self.json_output_manager.remove_subscription(node_id)
+                
+                # Remove from config
+                if node_id in self.config.subscribed_nodes:
+                    del self.config.subscribed_nodes[node_id]
+                
+                # Emit signal
+                self.node_unsubscribed.emit(node_id)
+                
+                logger.info(f"Unsubscribed from node: {node_id}")
+            
+        except Exception as e:
+            logger.warning(f"Error unsubscribing from node {node_id}: {str(e)}")
+    
     
     async def register_node(self, node_id: str, node_info: Dict[str, Any]):
         """
@@ -1203,11 +1251,6 @@ class OpcUaClient(QObject):
             # Read access level to verify it's writable
             access_level = await node.read_attribute(ua.AttributeIds.AccessLevel)
             writable = bool(access_level.Value.Value & ua.AccessLevel.CurrentWrite)
-            if not writable:
-                error_msg = f"Node {node_id} is not writable"
-                logger.error(error_msg)
-                self.connection_status_changed.emit(ConnectionStatus.ERROR, error_msg)
-                return
             
             # Get data type
             data_type_node = await node.read_data_type()
@@ -1217,7 +1260,7 @@ class OpcUaClient(QObject):
             # Preserve node_type from node_info
             node_type = node_info.get("node_type", "Standard")
             toggle_interval = node_info.get("toggle_interval", 1.0)
-
+            
             logger.debug(f"Registering node {node_id} with type {node_type} and interval {toggle_interval}")
             
             # Subscribe to data changes
@@ -1225,13 +1268,25 @@ class OpcUaClient(QObject):
             self.subscription_handles[node_id] = (handle, node_info.get("display_name", "Unknown"))
             
             # Store additional information
-            self.registered_nodes[node_id] = {
+            registered_node_info = {
                 "display_name": node_info.get("display_name", "Unknown"),
                 "data_type": data_type,
                 "node_type": node_type,  # Ensure node_type is preserved
                 "toggle_interval": toggle_interval,
-                "last_value": initial_value
+                "last_value": initial_value,
+                "writeable": writable
             }
+            self.registered_nodes[node_id] = registered_node_info
+            
+            # Get structure info
+            structure_info = self.get_node_structure_info(node_id)
+            
+            # Add to JSON output - this will create the file in the appropriate folder
+            self.json_output_manager.add_registered_node(
+                node_id,
+                registered_node_info,
+                structure_info
+            )
             
             # Setup livebit functionality if needed
             if node_type == "LiveBit" and data_type == "Boolean":
@@ -1275,28 +1330,30 @@ class OpcUaClient(QObject):
         Args:
             node_id: Node ID
         """
-        if not self.connected or not self.client:
+        if not self.connected or not self.client or not self.subscription:
             return
         
         try:
             logger.info(f"Unregistering node: {node_id}")
             
-            # Remove from subscription
             if node_id in self.subscription_handles:
                 handle, _ = self.subscription_handles[node_id]
-                if self.subscription:
-                    await self.subscription.unsubscribe(handle)
+                await self.subscription.unsubscribe(handle)
                 del self.subscription_handles[node_id]
             
             # Remove from registered nodes
             if node_id in self.registered_nodes:
                 del self.registered_nodes[node_id]
             
-            # Remove from livebit nodes
+            # Remove from livebit nodes if present
             if node_id in self.livebit_nodes:
                 del self.livebit_nodes[node_id]
-                if node_id in self.last_toggle_time:
-                    del self.last_toggle_time[node_id]
+            
+            if node_id in self.last_toggle_time:
+                del self.last_toggle_time[node_id]
+            
+            # Remove from JSON output - this will delete the file
+            self.json_output_manager.remove_registered_node(node_id)
             
             # Remove from config
             if node_id in self.config.registered_nodes:
@@ -1497,15 +1554,16 @@ class OpcUaClient(QObject):
                     # Update last toggle time
                     self.last_toggle_time[node_id] = current_time
     
+    # Add these methods to the client_core.py file right after the process_livebit_nodes method:
+
+    # Remove this method as it's no longer needed:
+    """
+    def check_custom_node_writes(self):
+        # This method is removed - file watcher handles this now
+    """
+
     def datachange_notification(self, node: Node, val: Any, data: ua.DataValue):
-        """
-        Callback for data change notifications
-        
-        Args:
-            node: Changed node
-            val: New value
-            data: Full data value with timestamp, etc.
-        """
+        """Callback for data change notifications"""
         try:
             node_id = node.nodeid.to_string()
             
@@ -1524,37 +1582,76 @@ class OpcUaClient(QObject):
             if node_id in self.subscription_handles:
                 _, display_name = self.subscription_handles[node_id]
                 
-                # Update XML
-                self.add_node_to_xml(node_id, display_name, val)
+                # Update JSON output for subscriptions
+                self.json_output_manager.update_subscription_value(node_id, val)
                 
-                # Emit signal - for both subscribed and registered nodes
+                # Emit signal
                 self.subscription_data_changed.emit(node_id, val, timestamp_str)
             
             # Handle registered node
             if node_id in self.registered_nodes:
                 self.registered_nodes[node_id]["last_value"] = val
                 
+                # Check if this is a custom node that we're controlling via file
+                node_info = self.registered_nodes[node_id]
+                if node_info.get("node_type") == "Custom":
+                    # For custom nodes, we only update the file after successful writes
+                    # Not on general data changes to prevent conflicts
+                    if not self.json_output_manager.active_write_requests.get(node_id):
+                        # Only update if we're not currently writing to this node
+                        self.json_output_manager.update_registered_node_value(node_id, val)
+                else:
+                    # For non-custom nodes, update normally
+                    self.json_output_manager.update_registered_node_value(node_id, val)
+                
+                # Emit signal
+                self.subscription_data_changed.emit(node_id, val, timestamp_str)
+            
         except Exception as e:
             logger.error(f"Error in data change notification: {str(e)}")
 
-    def status_change_notification(self, status):
+    # Add a check to on_file_changed to not process our own updates:
+    
+    def on_file_changed(self, filepath: str):
+        """Handle file change"""
+        try:
+            with open(filepath, 'r') as f:
+                node_data = json.load(f)
+            
+            node_id = node_data.get("node_id")
+            if not node_id:
+                return
+            
+            # Check if value has actually changed
+            old_value = None
+            if node_id in self.registered_nodes_data:
+                old_value = self.registered_nodes_data[node_id].get("value")
+            
+            new_value = node_data.get("value")
+            
+            # Only request write if value changed and not if metadata changed
+            if new_value != old_value:
+                logger.info(f"External change detected for node {node_id}: {old_value} -> {new_value}")
+                
+                # Check if we're currently writing to this node
+                if node_id not in self.active_write_requests:
+                    self.request_write(node_id, new_value, filepath)
+                else:
+                    logger.debug(f"Skipping write request for {node_id} - write already in progress")
+            
+            # Update internal data
+            self.registered_nodes_data[node_id] = node_data
+            self.json_updated.emit(filepath)
+            
+        except Exception as e:
+            logger.error(f"Error processing file change for {filepath}: {str(e)}")
+
+    def on_json_updated(self, filename: str):
         """
-        Callback for subscription status changes
+        Handle JSON output file update
         
         Args:
-            status: New status
+            filename: Updated filename
         """
-        try:
-            if hasattr(status, 'Status'):
-                # This is a StatusChangeNotification object
-                status_code = status.Status
-            else:
-                # This might be a raw status code
-                status_code = ua.StatusCode(status)
-                
-            logger.info(f"Subscription status changed: {status_code.name}")
-            
-            if status_code.is_bad():
-                logger.warning(f"Subscription status is bad: {status_code.name}")
-        except Exception as e:
-            logger.error(f"Error in subscription status notification: {str(e)}")
+        # Emit signal to UI
+        self.json_updated.emit(filename)

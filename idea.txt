@@ -1,0 +1,13 @@
+
+
+I want to add a feature for this opcua client 
+
+import subprocess
+
+subprocess.call('C:\Windows\System32\powershell.exe Get-Process', shell=True)
+
+
+
+
+A way where all the output is in json instead of xml also for registered nodes is want a functionality that the node is placed as a json file and can be written by external it shows the contents and current value and its structure so it can be changed externally
+also if the node is not registered anymore its also not reflected in the directory and the file is gone. this as custom mode to write a node 

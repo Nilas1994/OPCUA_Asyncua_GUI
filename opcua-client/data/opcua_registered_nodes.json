@@ -1,0 +1,56 @@
+{
+  "by_type": {
+    "Custom": {
+      "ns=3;s=Demo.Dynamic.Scalar.Boolean": {
+        "data_type": "Boolean",
+        "display_name": "Boolean",
+        "node_id": "ns=3;s=Demo.Dynamic.Scalar.Boolean",
+        "node_type": "Custom",
+        "timestamp": "2025-05-04T03:01:22.431526",
+        "toggle_interval": 1.0,
+        "value": true,
+        "writeable": true
+      }
+    }
+  },
+  "data": {
+    "Unknown": {
+      "data_type": "Boolean",
+      "display_name": "Boolean",
+      "node_id": "ns=3;s=Demo.Dynamic.Scalar.Boolean",
+      "node_type": "Custom",
+      "timestamp": "2025-05-04T03:01:22.431526",
+      "toggle_interval": 1.0,
+      "value": true,
+      "writeable": true
+    }
+  },
+  "flat_data": {
+    "ns=3;s=Demo.Dynamic.Scalar.Boolean": {
+      "data_type": "Boolean",
+      "display_name": "Boolean",
+      "node_id": "ns=3;s=Demo.Dynamic.Scalar.Boolean",
+      "node_type": "Custom",
+      "timestamp": "2025-05-04T03:01:22.431526",
+      "toggle_interval": 1.0,
+      "value": true,
+      "writeable": true
+    }
+  },
+  "metadata": {
+    "file_type": "opcua_registered_nodes",
+    "generated_at": "2025-05-04T03:01:22.431526",
+    "node_count": 1,
+    "node_types": [
+      "Custom"
+    ],
+    "version": "1.0"
+  },
+  "structure": {
+    "ns=3;s=Demo.Dynamic.Scalar.Boolean": {
+      "display_name": "Unknown",
+      "node_class": "Unknown",
+      "parent_path": ""
+    }
+  }
+}

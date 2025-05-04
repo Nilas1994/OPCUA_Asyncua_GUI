@@ -1,0 +1,30 @@
+{
+  "data": {
+    "Boolean": {
+      "display_name": "Boolean",
+      "node_id": "ns=3;s=Demo.Dynamic.Scalar.Boolean",
+      "timestamp": "2025-05-04T03:01:22.430414",
+      "value": true
+    }
+  },
+  "flat_data": {
+    "ns=3;s=Demo.Dynamic.Scalar.Boolean": {
+      "display_name": "Boolean",
+      "node_id": "ns=3;s=Demo.Dynamic.Scalar.Boolean",
+      "timestamp": "2025-05-04T03:01:22.430414",
+      "value": true
+    }
+  },
+  "metadata": {
+    "file_type": "opcua_subscriptions",
+    "generated_at": "2025-05-04T03:01:22.430414",
+    "node_count": 1,
+    "version": "1.0"
+  },
+  "structure": {
+    "ns=3;s=Demo.Dynamic.Scalar.Boolean": {
+      "display_name": "Boolean",
+      "parent_path": ""
+    }
+  }
+}
